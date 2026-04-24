@@ -710,376 +710,289 @@
 
 <script>
 /* ============================================================
-   ============== SUPABASE CONFIGURATION (cloud-only v6) =====
-   localStorage haitumiki tena kuhifadhi data ya app.
-   Tunabaki na localStorage TU kwa lugha (LANG_KEY).
+   ============== SUPABASE CONFIGURATION ======================
    ============================================================ */
 const SUPABASE_URL = 'https://zuqzqzdcxprwljjhkafz.supabase.co';
 const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Inp1cXpxemRjeHByd2xqamhrYWZ6Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzY4Njg1MDUsImV4cCI6MjA5MjQ0NDUwNX0.0FQ4f09Y-erbGd4TmBwyMUCWtsmUrscZpjv3YOCmqJY';
 
-const sbClient = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY, {
-  auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: true }
-});
+// Tengeneza client na uihifadhi kwenye sbClient (epuka kugongana na window.supabase)
+const sbClient = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 
-function sanitizeAuthUserId(value){
-  if (typeof value !== 'string') return null;
-  const c = value.trim();
-  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(c) ? c : null;
+/* ============================================================
+   ============== SUPABASE SYNC (FIXED v4) ====================
+   - Schools: insert/upsert mara TU baada ya signUp; tunahifadhi
+     server_id (UUID) kwenye s.serverId ili tuijue.
+   - Students: insert HATA bila school_id (tutaiweka baadaye).
+   - Tunatumia mapping ya (contact,level) -> server UUID.
+   ============================================================ */
+
+/* Sync ya kawaida (batch) — backup snapshot + schools + students */
+async function resolveAuthUserId(preferredEmail) {
+  try {
+    const { data: userData } = await sbClient.auth.getUser();
+    if (userData && userData.user && userData.user.id) return userData.user.id;
+  } catch (e) {}
+
+  try {
+    const { data: sessionData } = await sbClient.auth.getSession();
+    const sessionUser = sessionData && sessionData.session ? sessionData.session.user : null;
+    if (sessionUser && sessionUser.id) return sessionUser.id;
+  } catch (e) {}
+
+  return null;
 }
-async function currentUserId(){
-  try { const { data } = await sbClient.auth.getUser(); return data?.user?.id || null; }
-  catch(e){ return null; }
+
+function sanitizeAuthUserId(value) {
+  if (typeof value !== 'string') return null;
+  const clean = value.trim();
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(clean) ? clean : null;
+}
+
+async function backupToSupabase(dbData) {
+  try {
+    if (!sbClient || typeof sbClient.from !== 'function') {
+      console.error('Supabase client haijaanzishwa vyema.');
+      return;
+    }
+
+    sbClient.from('zayoma_backups')
+      .upsert({ id: 1, data: dbData, updated_at: new Date().toISOString() })
+      .then(({ error }) => { if (error) console.warn('Backup snapshot error:', error.message); });
+
+    if (Array.isArray(dbData.schools) && dbData.schools.length) {
+      const dedup = new Map();
+      dbData.schools.forEach(s => {
+        const key = `${(s.contact||'').trim()}|${(s.level||'').trim()}`;
+        dedup.set(key, s);
+      });
+
+      const schoolRows = Array.from(dedup.values()).map(s => ({
+        ...(s.serverId ? { id: s.serverId } : {}),
+        name: s.name,
+        contact: s.contact,
+        auth_user_id: sanitizeAuthUserId(s.authUserId),
+        level: s.level,
+        status: s.schoolStatus || 'pending',
+        created_at: new Date(s.createdAt || Date.now()).toISOString()
+      }));
+
+      try {
+        const { data: upserted, error } = await sbClient
+          .from('zayoma_schools')
+          .upsert(schoolRows, { onConflict: 'contact,level', ignoreDuplicates: false })
+          .select('id, contact, level, status, auth_user_id');
+
+        if (error) {
+          console.warn('Schools sync error:', error.message, schoolRows);
+        } else if (Array.isArray(upserted)) {
+          const byKey = {};
+          upserted.forEach(r => { byKey[`${r.contact}|${r.level}`] = r; });
+          let changed = false;
+          dbData.schools.forEach(s => {
+            const k = `${(s.contact||'').trim()}|${(s.level||'').trim()}`;
+            const row = byKey[k];
+            if (row) {
+              if (s.serverId !== row.id) { s.serverId = row.id; changed = true; }
+              if (s.schoolStatus !== row.status) { s.schoolStatus = row.status; changed = true; }
+              const authId = sanitizeAuthUserId(row.auth_user_id);
+              if (authId && s.authUserId !== authId) { s.authUserId = authId; changed = true; }
+            }
+          });
+          if (changed) localStorage.setItem(DB_KEY, JSON.stringify(dbData));
+        }
+      } catch (e) {
+        console.warn('Schools sync exception:', e.message);
+      }
+    }
+
+    if (Array.isArray(dbData.students) && dbData.students.length) {
+      const studentRows = dbData.students.map(s => {
+        let serverSchoolId = null;
+        if (s.schoolId) {
+          const sch = dbData.schools.find(x => x.id === s.schoolId);
+          serverSchoolId = (sch && sch.serverId) ? sch.serverId : null;
+        }
+        return {
+          ...(s.serverId ? { id: s.serverId } : {}),
+          name: s.name,
+          contact: s.contact,
+          auth_user_id: sanitizeAuthUserId(s.authUserId),
+          level: s.level,
+          status: s.status || 'new',
+          school_id: serverSchoolId,
+          class_id: s.classId || null,
+          applied_at: s.appliedAt ? new Date(s.appliedAt).toISOString() : null,
+          verified_at: s.verifiedAt ? new Date(s.verifiedAt).toISOString() : null,
+          created_at: new Date(s.createdAt || Date.now()).toISOString()
+        };
+      });
+
+      try {
+        const { data: upserted, error } = await sbClient
+          .from('zayoma_students')
+          .upsert(studentRows, { onConflict: 'contact,level', ignoreDuplicates: false })
+          .select('id, contact, level, auth_user_id');
+        if (error) {
+          console.warn('Students sync error:', error.message, studentRows);
+        } else if (Array.isArray(upserted)) {
+          const byKey = {};
+          upserted.forEach(r => { byKey[`${r.contact}|${r.level}`] = r; });
+          let changed = false;
+          dbData.students.forEach(s => {
+            const k = `${(s.contact||'').trim()}|${(s.level||'').trim()}`;
+            const row = byKey[k];
+            if (row) {
+              if (row.id && s.serverId !== row.id) { s.serverId = row.id; changed = true; }
+              const authId = sanitizeAuthUserId(row.auth_user_id);
+              if (authId && s.authUserId !== authId) { s.authUserId = authId; changed = true; }
+            }
+          });
+          if (changed) localStorage.setItem(DB_KEY, JSON.stringify(dbData));
+        }
+      } catch (e) {
+        console.warn('Students sync exception:', e.message);
+      }
+    }
+  } catch (err) {
+    console.error("Mfumo haukuweza kuwasiliana na Supabase:", err);
+  }
 }
 
 /* ============================================================
-   ============ CLOUD DATA LAYER (zinaandika Supabase) =======
-   Kila operation: andika cloud kwanza, kisha sasisha cache `db`.
+   ============== LOAD FROM SUPABASE (DATA NEVER LOST) ========
+   Inaitwa mara tu app inapoanza. Inachota schools na students
+   kutoka cloud na kuziunganisha na localStorage.
    ============================================================ */
-const cloud = {
-  async loadAll(){
-    const uid = await currentUserId();
-    if (!uid) return;
-    const tables = [
-      ['zayoma_schools','schools'], ['zayoma_classes','classes'], ['zayoma_subjects','subjects'],
-      ['zayoma_students','students'], ['zayoma_attendance','attendance'],
-      ['zayoma_teacher_questions','teacherQuestions'], ['zayoma_question_answers','questionAnswers'],
-      ['zayoma_exams','exams'], ['zayoma_submissions','submissions'],
-      ['zayoma_live','liveClasses'], ['zayoma_qbank','qbank'],
-      ['zayoma_messages','messages']
-    ];
-    for (const [tbl, key] of tables) {
-      try {
-        const { data, error } = await sbClient.from(tbl).select('*').limit(2000);
-        if (error) { console.warn('load '+tbl+':', error.message); continue; }
-        db[key] = (data || []).map(r => normalize(tbl, r));
-      } catch(e){ console.warn('load exc '+tbl+':', e.message); }
+async function loadFromSupabase() {
+  try {
+    if (!sbClient || typeof sbClient.from !== 'function') return;
+
+    // 1) Schools
+    const { data: schools, error: sErr } = await sbClient
+      .from('zayoma_schools')
+      .select('id, name, contact, level, status, auth_user_id, created_at');
+    if (sErr) { console.warn('Load schools error:', sErr.message); }
+    else if (Array.isArray(schools)) {
+      schools.forEach(srv => {
+        const key = `${srv.contact}|${srv.level}`;
+        let local = db.schools.find(x => `${x.contact}|${x.level}` === key);
+        if (!local) {
+          local = {
+            id: 'srv_' + srv.id.slice(0,8),
+            serverId: srv.id,
+            name: srv.name,
+            contact: srv.contact,
+            level: srv.level,
+            authUserId: sanitizeAuthUserId(srv.auth_user_id),
+            schoolStatus: srv.status || 'pending',
+            password: '', // password haihifadhiwi server — tunategemea Supabase Auth
+            createdAt: new Date(srv.created_at).getTime()
+          };
+          db.schools.push(local);
+        } else {
+          local.serverId = srv.id;
+          local.schoolStatus = srv.status || local.schoolStatus || 'pending';
+          local.authUserId = sanitizeAuthUserId(local.authUserId) || sanitizeAuthUserId(srv.auth_user_id);
+        }
+      });
     }
-    refreshStats && refreshStats();
-  },
 
-  // ---------- SCHOOLS ----------
-  async createSchool(payload){
-    const uid = await currentUserId();
-    const row = { auth_user_id: uid, name: payload.name, contact: payload.contact,
-                  level: payload.level, status: 'approved' };
-    const { data, error } = await sbClient.from('zayoma_schools').insert(row).select().single();
-    if (error) throw error;
-    const local = normalize('schools', data);
-    db.schools.push(local);
-    return local;
-  },
+    // 2) Students
+    const { data: students, error: stErr } = await sbClient
+      .from('zayoma_students')
+      .select('id, name, contact, level, status, school_id, class_id, auth_user_id, applied_at, verified_at, created_at');
+    if (stErr) { console.warn('Load students error:', stErr.message); }
+    else if (Array.isArray(students)) {
+      students.forEach(srv => {
+        const key = `${srv.contact}|${srv.level}`;
+        let local = db.students.find(x => `${x.contact}|${x.level}` === key);
+        // Tafuta local school id kutoka serverId
+        const localSchool = srv.school_id ? db.schools.find(s => s.serverId === srv.school_id) : null;
+        if (!local) {
+          local = {
+            id: 'srv_' + srv.id.slice(0,8),
+            serverId: srv.id,
+            name: srv.name,
+            contact: srv.contact,
+            level: srv.level,
+            status: srv.status || 'new',
+            schoolId: localSchool ? localSchool.id : null,
+            classId: srv.class_id || null,
+            authUserId: sanitizeAuthUserId(srv.auth_user_id),
+            password: '',
+            appliedAt: srv.applied_at ? new Date(srv.applied_at).getTime() : null,
+            verifiedAt: srv.verified_at ? new Date(srv.verified_at).getTime() : null,
+            createdAt: new Date(srv.created_at).getTime()
+          };
+          db.students.push(local);
+        } else {
+          local.serverId = srv.id;
+          local.status = srv.status || local.status;
+          if (localSchool) local.schoolId = localSchool.id;
+          if (srv.class_id) local.classId = srv.class_id;
+          local.authUserId = sanitizeAuthUserId(local.authUserId) || sanitizeAuthUserId(srv.auth_user_id);
+        }
+      });
+    }
 
-  // ---------- STUDENTS ----------
-  async createStudent(payload){
-    const uid = await currentUserId();
-    const row = { auth_user_id: uid, name: payload.name, contact: payload.contact,
-                  level: payload.level, status: 'new' };
-    const { data, error } = await sbClient.from('zayoma_students').insert(row).select().single();
-    if (error) throw error;
-    const local = normalize('students', data);
-    db.students.push(local);
-    return local;
-  },
-  async updateStudent(id, patch){
-    const cloudPatch = denormalize('students', patch);
-    const { data, error } = await sbClient.from('zayoma_students').update(cloudPatch).eq('id', id).select().single();
-    if (error) throw error;
-    const idx = db.students.findIndex(s=>s.id===id);
-    if (idx>=0) db.students[idx] = normalize('students', data);
-    return data;
-  },
-  async applyToSchool(studentId, schoolId){
-    return cloud.updateStudent(studentId, { schoolId, status:'pending', appliedAt: new Date().toISOString() });
-  },
-  async verifyStudent(studentId, classId){
-    return cloud.updateStudent(studentId, { status:'verified', classId, verifiedAt: new Date().toISOString() });
-  },
-  async rejectStudent(studentId){
-    return cloud.updateStudent(studentId, { status:'rejected' });
-  },
-
-  // ---------- CLASSES ----------
-  async createClass(payload){
-    const row = { school_id: payload.schoolId, name: payload.name, level: payload.level||null, year: payload.year||null };
-    const { data, error } = await sbClient.from('zayoma_classes').insert(row).select().single();
-    if (error) throw error;
-    const local = normalize('classes', data);
-    db.classes.push(local);
-    return local;
-  },
-  async deleteClass(id){
-    const { error } = await sbClient.from('zayoma_classes').delete().eq('id', id);
-    if (error) throw error;
-    db.classes = db.classes.filter(c=>c.id!==id);
-  },
-
-  // ---------- SUBJECTS ----------
-  async createSubject(payload){
-    const row = { class_id: payload.classId, school_id: payload.schoolId,
-                  name: payload.name, code: payload.code||null,
-                  password_hash: payload.password||null,
-                  teacher_user_id: payload.teacherUserId||null };
-    const { data, error } = await sbClient.from('zayoma_subjects').insert(row).select().single();
-    if (error) throw error;
-    const local = normalize('subjects', data);
-    db.subjects.push(local);
-    return local;
-  },
-
-  // ---------- ATTENDANCE ----------
-  async markAttendance({schoolId, classId, subjectId, studentId, state='present', date, note}){
-    const uid = await currentUserId();
-    const row = { school_id: schoolId, class_id: classId, subject_id: subjectId||null,
-                  student_id: studentId, state, date: date || new Date().toISOString().slice(0,10),
-                  note: note||null, recorded_by: uid };
-    const { data, error } = await sbClient.from('zayoma_attendance').upsert(row, {
-      onConflict: 'student_id,date,subject_id'
-    }).select().single();
-    if (error) throw error;
-    const local = normalize('attendance', data);
-    const i = db.attendance.findIndex(a=>a.id===local.id);
-    if (i>=0) db.attendance[i]=local; else db.attendance.push(local);
-    return local;
-  },
-  async getAttendance({classId, date}){
-    let q = sbClient.from('zayoma_attendance').select('*');
-    if (classId) q = q.eq('class_id', classId);
-    if (date) q = q.eq('date', date);
-    const { data, error } = await q;
-    if (error) throw error;
-    return (data||[]).map(r => normalize('attendance', r));
-  },
-
-  // ---------- TEACHER QUESTIONS ----------
-  async sendQuestion({schoolId, classId, subjectId, title, body, kind='short',
-                     options=null, correctAnswer=null, points=1, attachmentUrl=null,
-                     dueAt=null}){
-    const uid = await currentUserId();
-    const row = { school_id: schoolId, class_id: classId, subject_id: subjectId||null,
-                  teacher_user_id: uid, title, body: body||null, kind,
-                  options: options, correct_answer: correctAnswer, points,
-                  attachment_url: attachmentUrl, due_at: dueAt, is_published: true };
-    const { data, error } = await sbClient.from('zayoma_teacher_questions').insert(row).select().single();
-    if (error) throw error;
-    const local = normalize('teacher_questions', data);
-    db.teacherQuestions.push(local);
-    return local;
-  },
-  async listQuestions({classId, subjectId}={}){
-    let q = sbClient.from('zayoma_teacher_questions').select('*').order('created_at',{ascending:false});
-    if (classId) q = q.eq('class_id', classId);
-    if (subjectId) q = q.eq('subject_id', subjectId);
-    const { data, error } = await q;
-    if (error) throw error;
-    return (data||[]).map(r => normalize('teacher_questions', r));
-  },
-  async answerQuestion({questionId, studentId, answer, attachmentUrl=null}){
-    const row = { question_id: questionId, student_id: studentId,
-                  answer, attachment_url: attachmentUrl };
-    const { data, error } = await sbClient.from('zayoma_question_answers')
-      .upsert(row, { onConflict: 'question_id,student_id' }).select().single();
-    if (error) throw error;
-    return normalize('question_answers', data);
-  },
-
-  // ---------- IMAGES / FILES (Supabase Storage) ----------
-  async uploadImage(file, { bucket='qbank-images', folder='' }={}){
-    const uid = await currentUserId();
-    if (!uid) throw new Error('Hujaingia');
-    const ext = (file.name.split('.').pop()||'png').toLowerCase();
-    const path = `${uid}/${folder?folder+'/':''}${Date.now()}_${Math.random().toString(36).slice(2,7)}.${ext}`;
-    const { error } = await sbClient.storage.from(bucket).upload(path, file, {
-      cacheControl: '3600', upsert: false, contentType: file.type
-    });
-    if (error) throw error;
-    const { data: urlData } = sbClient.storage.from(bucket).getPublicUrl(path);
-    // andika metadata
-    await sbClient.from('zayoma_files').insert({
-      owner_id: uid, bucket, path, filename: file.name,
-      mime_type: file.type, size_bytes: file.size, context: folder||bucket
-    });
-    return { path, publicUrl: urlData.publicUrl };
-  },
-  async uploadAvatar(file){
-    return cloud.uploadImage(file, { bucket:'avatars', folder:'avatar' });
-  },
-
-  // ---------- GENERIC CRUD ----------
-  async insert(table, row){
-    const { data, error } = await sbClient.from(table).insert(row).select().single();
-    if (error) throw error;
-    return data;
-  },
-  async update(table, id, patch){
-    const { data, error } = await sbClient.from(table).update(patch).eq('id', id).select().single();
-    if (error) throw error;
-    return data;
-  },
-  async remove(table, id){
-    const { error } = await sbClient.from(table).delete().eq('id', id);
-    if (error) throw error;
+    localStorage.setItem(DB_KEY, JSON.stringify(db));
+    console.log(`✓ Cloud sync: ${db.schools.length} schools, ${db.students.length} students`);
+  } catch (err) {
+    console.warn('loadFromSupabase exception:', err.message);
   }
-};
-
-/* ----- normalize/denormalize: badilisha snake_case <-> camelCase ----- */
-function normalize(table, r){
-  if (!r) return r;
-  const m = {
-    id:r.id, createdAt:r.created_at?new Date(r.created_at).getTime():Date.now()
-  };
-  if (table==='schools'){
-    return { ...m, name:r.name, contact:r.contact, level:r.level,
-             schoolStatus:r.status, status:r.status,
-             authUserId: sanitizeAuthUserId(r.auth_user_id), serverId:r.id };
-  }
-  if (table==='students'){
-    return { ...m, name:r.name, contact:r.contact, level:r.level, status:r.status,
-             schoolId:r.school_id, classId:r.class_id,
-             authUserId: sanitizeAuthUserId(r.auth_user_id), serverId:r.id,
-             appliedAt:r.applied_at?new Date(r.applied_at).getTime():null,
-             verifiedAt:r.verified_at?new Date(r.verified_at).getTime():null,
-             avatarUrl: r.avatar_url };
-  }
-  if (table==='classes'){
-    return { ...m, name:r.name, schoolId:r.school_id, level:r.level, year:r.year };
-  }
-  if (table==='subjects'){
-    return { ...m, name:r.name, code:r.code, classId:r.class_id, schoolId:r.school_id,
-             password:r.password_hash, teacherUserId:r.teacher_user_id,
-             notes:[], exams:[], submissions:[], results:[] };
-  }
-  if (table==='attendance'){
-    return { ...m, schoolId:r.school_id, classId:r.class_id, subjectId:r.subject_id,
-             studentId:r.student_id, date:r.date, state:r.state, note:r.note };
-  }
-  if (table==='teacher_questions'){
-    return { ...m, schoolId:r.school_id, classId:r.class_id, subjectId:r.subject_id,
-             teacherUserId:r.teacher_user_id, title:r.title, body:r.body,
-             kind:r.kind, options:r.options, correctAnswer:r.correct_answer,
-             points:r.points, attachmentUrl:r.attachment_url, dueAt:r.due_at,
-             isPublished:r.is_published };
-  }
-  if (table==='question_answers'){
-    return { ...m, questionId:r.question_id, studentId:r.student_id,
-             answer:r.answer, attachmentUrl:r.attachment_url, score:r.score };
-  }
-  if (table==='exams'){
-    return { ...m, subjectId:r.subject_id, classId:r.class_id, schoolId:r.school_id,
-             title:r.title, durationMinutes:r.duration_minutes, questions:r.questions||[] };
-  }
-  if (table==='submissions'){
-    return { ...m, examId:r.exam_id, studentId:r.student_id, answers:r.answers||[],
-             autoScore:r.auto_score, finalScore:r.final_score,
-             submittedAt:r.submitted_at?new Date(r.submitted_at).getTime():null };
-  }
-  if (table==='notes'){
-    return { ...m, subjectId:r.subject_id, classId:r.class_id, schoolId:r.school_id,
-             title:r.title, body:r.body, attachmentUrl:r.attachment_url };
-  }
-  if (table==='live_classes'){
-    return { ...m, subjectId:r.subject_id, classId:r.class_id, schoolId:r.school_id,
-             title:r.title, roomName:r.room_name, hostId:r.host_id, active:r.active };
-  }
-  if (table==='qbank'){
-    return { ...m, schoolId:r.school_id, subjectId:r.subject_id, title:r.title,
-             body:r.body, kind:r.kind, options:r.options,
-             correctAnswer:r.correct_answer, imageUrl:r.image_url };
-  }
-  if (table==='notifications'){
-    return { ...m, userId:r.user_id, title:r.title, body:r.body, link:r.link, readAt:r.read_at };
-  }
-  if (table==='messages'){
-    return { ...m, schoolId:r.school_id, classId:r.class_id, subjectId:r.subject_id,
-             senderId:r.sender_id, body:r.body, attachmentUrl:r.attachment_url };
-  }
-  return { ...m, ...r };
 }
-function denormalize(table, p){
-  const out = {};
-  const map = {
-    schoolId:'school_id', classId:'class_id', subjectId:'subject_id',
-    studentId:'student_id', authUserId:'auth_user_id',
-    appliedAt:'applied_at', verifiedAt:'verified_at',
-    avatarUrl:'avatar_url', schoolStatus:'status'
-  };
-  for (const k of Object.keys(p)) {
-    out[map[k] || k] = p[k];
-  }
-  return out;
-}
-
-/* ----- REALTIME subscriptions (auto-update db cache) ----- */
-function startRealtime(){
-  const channels = ['zayoma_schools','zayoma_students','zayoma_classes','zayoma_subjects',
-                    'zayoma_attendance','zayoma_teacher_questions','zayoma_question_answers',
-                    'zayoma_exams','zayoma_submissions','zayoma_live','zayoma_qbank',
-                    'zayoma_messages'];
-  channels.forEach(tbl=>{
-    sbClient.channel('rt-'+tbl).on('postgres_changes',
-      { event:'*', schema:'public', table: tbl },
-      (payload)=>{ try { applyRealtime(tbl, payload); } catch(e){ console.warn(e); } }
-    ).subscribe();
-  });
-}
-function applyRealtime(tbl, payload){
-  const keyMap = {
-    zayoma_schools:'schools', zayoma_students:'students', zayoma_classes:'classes',
-    zayoma_subjects:'subjects', zayoma_attendance:'attendance',
-    zayoma_teacher_questions:'teacherQuestions', zayoma_question_answers:'questionAnswers',
-    zayoma_exams:'exams', zayoma_submissions:'submissions',
-    zayoma_live:'liveClasses', zayoma_qbank:'qbank', zayoma_messages:'messages'
-  };
-  const key = keyMap[tbl]; if (!key || !db[key]) return;
-  const newRow = payload.new ? normalize(tbl, payload.new) : null;
-  const oldRow = payload.old || null;
-  if (payload.eventType === 'INSERT' && newRow) {
-    if (!db[key].some(x=>x.id===newRow.id)) db[key].push(newRow);
-  } else if (payload.eventType === 'UPDATE' && newRow) {
-    const i = db[key].findIndex(x=>x.id===newRow.id);
-    if (i>=0) db[key][i]=newRow; else db[key].push(newRow);
-  } else if (payload.eventType === 'DELETE' && oldRow) {
-    db[key] = db[key].filter(x=>x.id!==oldRow.id);
-  }
-  refreshStats && refreshStats();
-}
-
 
 /* ============================================================
    ============== SESSION MANAGEMENT (AUTO LOGIN) ==============
    ============================================================ */
-/* ===== SESSION (Supabase Auth tu — auto login via persistSession) ===== */
-function saveSession(/* type, id */){ /* no-op: supabase.auth.persistSession inashughulikia auto-login */ }
-function clearSession(){ /* tutaiondoa kupitia sbClient.auth.signOut() */ }
-async function loadFromSupabase(){ await cloud.loadAll(); }
-async function checkSession(){
+const SESSION_KEY = 'zayoma_session_v3';
+
+function saveSession(type, id) {
+  localStorage.setItem(SESSION_KEY, JSON.stringify({ type, id }));
+}
+
+function clearSession() {
+  localStorage.removeItem(SESSION_KEY);
+}
+
+function checkSession() {
   try {
-    const { data } = await sbClient.auth.getSession();
-    const user = data?.session?.user;
-    if (!user) return false;
-    await cloud.loadAll();
-    startRealtime();
-    // Tafuta kama mtumiaji ni shule au mwanafunzi
-    const sch = db.schools.find(s => s.authUserId === user.id);
-    if (sch) {
-      currentSchoolId = sch.id;
-      STATE.role = 'school'; STATE.level = sch.level;
-      enterSchoolApp();
-      return true;
-    }
-    const stu = db.students.find(s => s.authUserId === user.id);
-    if (stu) {
-      STATE.role = 'student'; STATE.level = stu.level;
-      if (stu.status === 'verified' && stu.schoolId && stu.classId) {
-        currentStudentId = stu.id; enterStudentApp();
-      } else if (stu.status === 'pending') {
-        pendingStudentId = stu.id; showStudentWaiting();
-      } else {
-        pendingStudentId = stu.id; showStudentSchoolPicker();
+    const sessionStr = localStorage.getItem(SESSION_KEY);
+    if (sessionStr) {
+      const session = JSON.parse(sessionStr);
+      
+      if (session.type === 'school') {
+        const sch = db.schools.find(s => s.id === session.id);
+        if (sch) {
+          currentSchoolId = sch.id;
+          STATE.role = 'school';
+          STATE.level = sch.level;
+          enterSchoolApp();
+          return true; // Imefanikiwa kuingia
+        }
+      } else if (session.type === 'student') {
+        const stu = db.students.find(s => s.id === session.id);
+        if (stu) {
+          STATE.role = 'student';
+          STATE.level = stu.level;
+          if (stu.status === 'verified' && stu.schoolId && stu.classId) {
+            currentStudentId = stu.id;
+            enterStudentApp();
+          } else if (stu.status === 'pending') {
+            pendingStudentId = stu.id;
+            showStudentWaiting();
+          } else {
+            pendingStudentId = stu.id;
+            showStudentSchoolPicker();
+          }
+          return true; // Imefanikiwa kuingia
+        }
       }
-      return true;
     }
-  } catch(e){ console.warn('checkSession:', e.message); }
-  return false;
+  } catch (e) {
+    console.error("Hitilafu kwenye kusoma session:", e);
+  }
+  return false; // Hakuna session iliyohifadhiwa
 }
 
 /* ============================================================
@@ -1276,14 +1189,21 @@ function toggleLanguage(){
 /* ============================================================
    ============== DB INITIALIZATION ===========================
    ============================================================ */
-/* DB ni in-memory cache TU — chanzo halisi ni Supabase (cloud-only v6) */
-let db = { schools:[], students:[], classes:[], subjects:[], attendance:[],
-           teacherQuestions:[], questionAnswers:[], exams:[], submissions:[],
-           notes:[], liveClasses:[], qbank:[], notifications:[], messages:[] };
-function saveDB(){
-  // Hook ya kurefresh UI tu. CRUD halisi inafanyika kupitia cloud.* (Supabase moja kwa moja).
-  try { refreshStats && refreshStats(); } catch(e){}
+const DB_KEY = 'zayoma_db_v3';
+let db = loadDB();
+function loadDB(){
+  try { const raw = localStorage.getItem(DB_KEY); if (raw) return JSON.parse(raw); } catch(e){}
+  return { schools:[], students:[], classes:[], liveClasses:[], qbank:[] };
 }
+
+function saveDB(){ 
+  localStorage.setItem(DB_KEY, JSON.stringify(db)); 
+  refreshStats();
+  backupToSupabase(db);
+}
+
+if (!db.schools) db.schools=[];
+if (!db.students) db.students=[];
 let currentSchoolId = null;  
 let currentStudentId = null; 
 let pendingStudentId = null; 
@@ -1416,26 +1336,26 @@ async function handleAuth(e, action){
 
       // 2) Tengeneza row ndani ya local db + Supabase tables
       if (role==='school'){
-        await cloud.loadAll();
         if (db.schools.some(s=>s.contact===contact && s.level===level)){
           finish(); toast(LANG==='sw'?'Shule tayari imesajiliwa':'School already registered','error'); return;
         }
-        const sch = await cloud.createSchool({ name:nameVal, contact, level });
+        const sch = { id:uid(), name:nameVal, contact, password, level, authUserId, schoolStatus:'pending', createdAt:Date.now() };
+        db.schools.push(sch); saveDB();
         currentSchoolId = sch.id;
-        startRealtime();
+        saveSession('school', sch.id);
         finish();
         toast(LANG==='sw'
-          ? 'Usajili umekamilika! Karibu kwenye Zayoma.'
-          : 'Registered! Welcome to Zayoma.', 'success');
+          ? 'Usajili umekamilika! Shule yako inasubiri uthibitisho wa admin.'
+          : 'Registered! Your school is awaiting admin approval.', 'success');
         enterSchoolApp();
       } else {
-        await cloud.loadAll();
         if (db.students.some(s=>s.contact===contact && s.level===level)){
           finish(); toast(LANG==='sw'?'Tayari umesajiliwa, ingia tu':'Already registered, just log in','warn'); return;
         }
-        const stu = await cloud.createStudent({ name:nameVal, contact, level });
+        const stu = { id:uid(), name:nameVal, contact, password, level, authUserId, status:'new', schoolId:null, classId:null, createdAt:Date.now() };
+        db.students.push(stu); saveDB();
         pendingStudentId = stu.id;
-        startRealtime();
+        saveSession('student', stu.id);
         finish();
         toast(LANG==='sw'?'Usajili umekamilika':'Registered');
         showStudentSchoolPicker();
@@ -1596,16 +1516,14 @@ function applyToSchool(schoolId){
       <button onclick="submitApplication('${schoolId}')" class="w-full bg-emerald-600 text-white py-3 rounded-xl font-bold text-sm hover:bg-emerald-700">${LANG==='sw'?'Tuma Maombi':'Send Application'}</button>
     </div>`);
 }
-async function submitApplication(schoolId){
+function submitApplication(schoolId){
   const stu = db.students.find(x=>x.id===pendingStudentId);
   const classId = document.getElementById('applyClassSelect').value || null;
-  stu.schoolId = schoolId; stu.classId = classId; stu.status = 'pending'; stu.appliedAt = Date.now();
-  try {
-    await cloud.updateStudent(stu.id||stu.serverId, {
-      schoolId, classId, status:'pending', appliedAt: new Date().toISOString()
-    });
-  } catch(e){ toast('Error: '+e.message, 'error'); return; }
-  closeModal();
+  stu.schoolId = schoolId;
+  stu.classId = classId;
+  stu.status = 'pending';
+  stu.appliedAt = Date.now();
+  saveDB(); closeModal();
   document.getElementById('screen-stu-pick').classList.add('hidden');
   showStudentWaiting();
 }
@@ -1642,12 +1560,10 @@ function checkVerificationStatus(){
     toast(LANG==='sw'?'Bado unasubiri verification':'Still awaiting verification','warn');
   }
 }
-async function cancelStudentRequest(){
+function cancelStudentRequest(){
   if (!confirm(LANG==='sw'?'Una uhakika unataka kughairi maombi?':'Cancel application?')) return;
   const stu = db.students.find(x=>x.id===pendingStudentId);
-  if (stu){ stu.status='new'; stu.schoolId=null; stu.classId=null;
-    try { await cloud.updateStudent(stu.id||stu.serverId, { status:'new', schoolId:null, classId:null }); } catch(e){ console.warn(e); }
-  }
+  if (stu){ stu.status='new'; stu.schoolId=null; stu.classId=null; saveDB(); }
   document.getElementById('screen-stu-wait').classList.add('hidden');
   showStudentSchoolPicker();
 }
@@ -1695,21 +1611,18 @@ function renderVerifications(){
   }).join('');
   refreshPendingBadge();
 }
-async function verifyStudent(stuId){
+function verifyStudent(stuId){
   const stu = db.students.find(s=>s.id===stuId); if (!stu) return;
   const cls = document.getElementById('verifClass-'+stuId).value;
   if (!cls){ toast(LANG==='sw'?'Chagua darasa':'Pick a class','error'); return; }
   stu.classId = cls; stu.status='verified'; stu.verifiedAt=Date.now();
-  try { await cloud.updateStudent(stu.id||stu.serverId, { status: stu.status, classId: stu.classId, verifiedAt: stu.verifiedAt ? new Date(stu.verifiedAt).toISOString() : null }); } catch(e){ console.warn(e); }
-  renderVerifications();
+  saveDB(); renderVerifications();
   toast(LANG==='sw'?'Mwanafunzi amethibitishwa':'Student verified');
 }
-async function rejectStudent(stuId){
+function rejectStudent(stuId){
   if (!confirm(LANG==='sw'?'Kataa maombi haya?':'Reject this application?')) return;
   const stu = db.students.find(s=>s.id===stuId); if (!stu) return;
-  stu.status='rejected';
-  try { await cloud.updateStudent(stu.id||stu.serverId, { status:'rejected' }); } catch(e){ console.warn(e); }
-  renderVerifications();
+  stu.status='rejected'; saveDB(); renderVerifications();
 }
 
 /* ============================================================
@@ -1821,16 +1734,13 @@ function openCreateClassModal(){
     </div>
   `);
 }
-async function createClass(){
+function createClass(){
   const name=document.getElementById('newClassName').value.trim();
   const level=document.getElementById('newClassLevel').value;
   const pwd=document.getElementById('newClassPwd').value;
   if (!name||!level||!pwd){ toast(t('fill_all'),'error'); return; }
-  try {
-    const cls = await cloud.createClass({ schoolId: currentSchoolId, name, level });
-    cls.password = pwd; cls.system = STATE.level; cls.subjects = []; cls.attendance = []; cls.results = [];
-    closeModal(); renderClasses(); toast(t('saved'));
-  } catch(e){ toast('Error: '+e.message, 'error'); }
+  db.classes.push({ id:uid(), name, level, system:STATE.level, schoolId:currentSchoolId, password:pwd, subjects:[], attendance:[], results:[], createdAt:Date.now() });
+  saveDB(); closeModal(); renderClasses(); toast(t('saved'));
 }
 function renderClasses(){
   document.getElementById('classListWrap').classList.remove('hidden');
@@ -1868,11 +1778,10 @@ function openClass(id){
   switchClassTab('attendance', document.querySelector('#classDetailWrap .tab-btn'));
 }
 function backToClassList(){ currentClassId=null; renderClasses(); }
-async function deleteCurrentClass(){
+function deleteCurrentClass(){
   if (!currentClassId || !confirm(t('confirm_del_class'))) return;
-  try { await cloud.deleteClass(currentClassId); }
-  catch(e){ return toast('Error: '+e.message,'error'); }
-  backToClassList(); toast(t('deleted'));
+  db.classes = db.classes.filter(c=>c.id!==currentClassId);
+  saveDB(); backToClassList(); toast(t('deleted'));
 }
 function switchClassTab(tab, btn){
   document.querySelectorAll('.class-tab').forEach(t=>t.classList.add('hidden'));
@@ -2493,22 +2402,12 @@ function startTimer(duration){
    ============================================================ */
 applyI18n();
 
-// Bootstrap: subiri Supabase Auth, pakua data, washa realtime
+// 1) Pakua data kutoka Supabase kwanza (data isipotee kamwe!)
+// 2) Halafu angalia kama kuna session ya zamani
 (async () => {
-  try {
-    const ok = await checkSession();   // hii inafanya cloud.loadAll() + startRealtime() ndani
-    if (!ok) {
-      // Hakuna session — onyesha skrini ya kuchagua lugha (default)
-    }
-    // Sikiliza mabadiliko ya auth (e.g. signOut kutoka tab nyingine)
-    sbClient.auth.onAuthStateChange((event, session) => {
-      if (event === 'SIGNED_OUT') {
-        currentSchoolId = null; currentStudentId = null; pendingStudentId = null;
-        location.reload();
-      }
-    });
-  } catch (e) {
-    console.error('Bootstrap error:', e);
+  await loadFromSupabase();
+  if (!checkSession()) {
+    // Hakuna session — mwache achague lugha
   }
 })();
 
