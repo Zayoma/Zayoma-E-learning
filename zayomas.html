@@ -727,6 +727,27 @@ const sbClient = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
    ============================================================ */
 
 /* Sync ya kawaida (batch) — backup snapshot + schools + students */
+async function resolveAuthUserId(preferredEmail) {
+  try {
+    const { data: userData } = await sbClient.auth.getUser();
+    if (userData && userData.user && userData.user.id) return userData.user.id;
+  } catch (e) {}
+
+  try {
+    const { data: sessionData } = await sbClient.auth.getSession();
+    const sessionUser = sessionData && sessionData.session ? sessionData.session.user : null;
+    if (sessionUser && sessionUser.id) return sessionUser.id;
+  } catch (e) {}
+
+  return null;
+}
+
+function sanitizeAuthUserId(value) {
+  if (typeof value !== 'string') return null;
+  const clean = value.trim();
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(clean) ? clean : null;
+}
+
 async function backupToSupabase(dbData) {
   try {
     if (!sbClient || typeof sbClient.from !== 'function') {
@@ -734,24 +755,22 @@ async function backupToSupabase(dbData) {
       return;
     }
 
-    // 1) Snapshot ya database nzima (kwa restore)
     sbClient.from('zayoma_backups')
       .upsert({ id: 1, data: dbData, updated_at: new Date().toISOString() })
       .then(({ error }) => { if (error) console.warn('Backup snapshot error:', error.message); });
 
-    // 2) Sync schools — upsert kwa (contact, level)
     if (Array.isArray(dbData.schools) && dbData.schools.length) {
       const dedup = new Map();
       dbData.schools.forEach(s => {
         const key = `${(s.contact||'').trim()}|${(s.level||'').trim()}`;
         dedup.set(key, s);
       });
+
       const schoolRows = Array.from(dedup.values()).map(s => ({
-        // Kama tuna server UUID tayari, tumia hiyo (kuhakikisha update siyo insert mpya)
         ...(s.serverId ? { id: s.serverId } : {}),
         name: s.name,
         contact: s.contact,
-        auth_user_id: s.authUserId || null,
+        auth_user_id: sanitizeAuthUserId(s.authUserId),
         level: s.level,
         status: s.schoolStatus || 'pending',
         created_at: new Date(s.createdAt || Date.now()).toISOString()
@@ -761,10 +780,10 @@ async function backupToSupabase(dbData) {
         const { data: upserted, error } = await sbClient
           .from('zayoma_schools')
           .upsert(schoolRows, { onConflict: 'contact,level', ignoreDuplicates: false })
-          .select('id, contact, level, status');
+          .select('id, contact, level, status, auth_user_id');
 
         if (error) {
-          console.warn('Schools sync error:', error.message);
+          console.warn('Schools sync error:', error.message, schoolRows);
         } else if (Array.isArray(upserted)) {
           const byKey = {};
           upserted.forEach(r => { byKey[`${r.contact}|${r.level}`] = r; });
@@ -775,6 +794,8 @@ async function backupToSupabase(dbData) {
             if (row) {
               if (s.serverId !== row.id) { s.serverId = row.id; changed = true; }
               if (s.schoolStatus !== row.status) { s.schoolStatus = row.status; changed = true; }
+              const authId = sanitizeAuthUserId(row.auth_user_id);
+              if (authId && s.authUserId !== authId) { s.authUserId = authId; changed = true; }
             }
           });
           if (changed) localStorage.setItem(DB_KEY, JSON.stringify(dbData));
@@ -784,10 +805,8 @@ async function backupToSupabase(dbData) {
       }
     }
 
-    // 3) Sync students — WOTE, hata bila shule
     if (Array.isArray(dbData.students) && dbData.students.length) {
       const studentRows = dbData.students.map(s => {
-        // Pata server UUID ya school (kama anayo)
         let serverSchoolId = null;
         if (s.schoolId) {
           const sch = dbData.schools.find(x => x.id === s.schoolId);
@@ -797,10 +816,10 @@ async function backupToSupabase(dbData) {
           ...(s.serverId ? { id: s.serverId } : {}),
           name: s.name,
           contact: s.contact,
-          auth_user_id: s.authUserId || null,
+          auth_user_id: sanitizeAuthUserId(s.authUserId),
           level: s.level,
           status: s.status || 'new',
-          school_id: serverSchoolId, // inaweza kuwa null — sasa ni sawa
+          school_id: serverSchoolId,
           class_id: s.classId || null,
           applied_at: s.appliedAt ? new Date(s.appliedAt).toISOString() : null,
           verified_at: s.verifiedAt ? new Date(s.verifiedAt).toISOString() : null,
@@ -812,16 +831,21 @@ async function backupToSupabase(dbData) {
         const { data: upserted, error } = await sbClient
           .from('zayoma_students')
           .upsert(studentRows, { onConflict: 'contact,level', ignoreDuplicates: false })
-          .select('id, contact, level');
+          .select('id, contact, level, auth_user_id');
         if (error) {
-          console.warn('Students sync error:', error.message);
+          console.warn('Students sync error:', error.message, studentRows);
         } else if (Array.isArray(upserted)) {
           const byKey = {};
-          upserted.forEach(r => { byKey[`${r.contact}|${r.level}`] = r.id; });
+          upserted.forEach(r => { byKey[`${r.contact}|${r.level}`] = r; });
           let changed = false;
           dbData.students.forEach(s => {
             const k = `${(s.contact||'').trim()}|${(s.level||'').trim()}`;
-            if (byKey[k] && s.serverId !== byKey[k]) { s.serverId = byKey[k]; changed = true; }
+            const row = byKey[k];
+            if (row) {
+              if (row.id && s.serverId !== row.id) { s.serverId = row.id; changed = true; }
+              const authId = sanitizeAuthUserId(row.auth_user_id);
+              if (authId && s.authUserId !== authId) { s.authUserId = authId; changed = true; }
+            }
           });
           if (changed) localStorage.setItem(DB_KEY, JSON.stringify(dbData));
         }
@@ -859,7 +883,7 @@ async function loadFromSupabase() {
             name: srv.name,
             contact: srv.contact,
             level: srv.level,
-            authUserId: srv.auth_user_id,
+            authUserId: sanitizeAuthUserId(srv.auth_user_id),
             schoolStatus: srv.status || 'pending',
             password: '', // password haihifadhiwi server — tunategemea Supabase Auth
             createdAt: new Date(srv.created_at).getTime()
@@ -868,7 +892,7 @@ async function loadFromSupabase() {
         } else {
           local.serverId = srv.id;
           local.schoolStatus = srv.status || local.schoolStatus || 'pending';
-          local.authUserId = local.authUserId || srv.auth_user_id;
+          local.authUserId = sanitizeAuthUserId(local.authUserId) || sanitizeAuthUserId(srv.auth_user_id);
         }
       });
     }
@@ -894,7 +918,7 @@ async function loadFromSupabase() {
             status: srv.status || 'new',
             schoolId: localSchool ? localSchool.id : null,
             classId: srv.class_id || null,
-            authUserId: srv.auth_user_id,
+            authUserId: sanitizeAuthUserId(srv.auth_user_id),
             password: '',
             appliedAt: srv.applied_at ? new Date(srv.applied_at).getTime() : null,
             verifiedAt: srv.verified_at ? new Date(srv.verified_at).getTime() : null,
@@ -906,7 +930,7 @@ async function loadFromSupabase() {
           local.status = srv.status || local.status;
           if (localSchool) local.schoolId = localSchool.id;
           if (srv.class_id) local.classId = srv.class_id;
-          local.authUserId = local.authUserId || srv.auth_user_id;
+          local.authUserId = sanitizeAuthUserId(local.authUserId) || sanitizeAuthUserId(srv.auth_user_id);
         }
       });
     }
@@ -1308,7 +1332,7 @@ async function handleAuth(e, action){
         toast((LANG==='sw'?'Usajili umeshindikana: ':'Signup failed: ')+authErr.message,'error');
         return;
       }
-      const authUserId = authData.user ? authData.user.id : null;
+      const authUserId = sanitizeAuthUserId(authData.user ? authData.user.id : null) || await resolveAuthUserId(authEmail);
 
       // 2) Tengeneza row ndani ya local db + Supabase tables
       if (role==='school'){
