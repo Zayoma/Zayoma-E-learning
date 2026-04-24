@@ -718,7 +718,15 @@ const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZ
 // Tengeneza client na uihifadhi kwenye sbClient (epuka kugongana na window.supabase)
 const sbClient = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 
-/* Sync data nzima kwenda Supabase: schools, students na backup snapshot */
+/* ============================================================
+   ============== SUPABASE SYNC (FIXED v4) ====================
+   - Schools: insert/upsert mara TU baada ya signUp; tunahifadhi
+     server_id (UUID) kwenye s.serverId ili tuijue.
+   - Students: insert HATA bila school_id (tutaiweka baadaye).
+   - Tunatumia mapping ya (contact,level) -> server UUID.
+   ============================================================ */
+
+/* Sync ya kawaida (batch) — backup snapshot + schools + students */
 async function backupToSupabase(dbData) {
   try {
     if (!sbClient || typeof sbClient.from !== 'function') {
@@ -731,21 +739,21 @@ async function backupToSupabase(dbData) {
       .upsert({ id: 1, data: dbData, updated_at: new Date().toISOString() })
       .then(({ error }) => { if (error) console.warn('Backup snapshot error:', error.message); });
 
-    // 2) Sync schools — upsert kwa (contact, level) ili kuepuka 409 duplicate
-    //    Tunatumia Map kuondoa duplicates ndani ya batch yenyewe pia.
-    let schoolIdMap = {}; // local_id -> server_id (UUID halisi kutoka DB)
+    // 2) Sync schools — upsert kwa (contact, level)
     if (Array.isArray(dbData.schools) && dbData.schools.length) {
       const dedup = new Map();
       dbData.schools.forEach(s => {
         const key = `${(s.contact||'').trim()}|${(s.level||'').trim()}`;
-        // ya mwisho inashinda (recent wins)
         dedup.set(key, s);
       });
       const schoolRows = Array.from(dedup.values()).map(s => ({
+        // Kama tuna server UUID tayari, tumia hiyo (kuhakikisha update siyo insert mpya)
+        ...(s.serverId ? { id: s.serverId } : {}),
         name: s.name,
         contact: s.contact,
         auth_user_id: s.authUserId || null,
         level: s.level,
+        status: s.schoolStatus || 'pending',
         created_at: new Date(s.createdAt || Date.now()).toISOString()
       }));
 
@@ -753,50 +761,160 @@ async function backupToSupabase(dbData) {
         const { data: upserted, error } = await sbClient
           .from('zayoma_schools')
           .upsert(schoolRows, { onConflict: 'contact,level', ignoreDuplicates: false })
-          .select('id, contact, level');
+          .select('id, contact, level, status');
 
         if (error) {
           console.warn('Schools sync error:', error.message);
         } else if (Array.isArray(upserted)) {
-          // Jenga ramani: local school id -> server id kwa kupitia (contact,level)
           const byKey = {};
-          upserted.forEach(r => { byKey[`${r.contact}|${r.level}`] = r.id; });
+          upserted.forEach(r => { byKey[`${r.contact}|${r.level}`] = r; });
+          let changed = false;
           dbData.schools.forEach(s => {
             const k = `${(s.contact||'').trim()}|${(s.level||'').trim()}`;
-            if (byKey[k]) schoolIdMap[s.id] = byKey[k];
+            const row = byKey[k];
+            if (row) {
+              if (s.serverId !== row.id) { s.serverId = row.id; changed = true; }
+              if (s.schoolStatus !== row.status) { s.schoolStatus = row.status; changed = true; }
+            }
           });
+          if (changed) localStorage.setItem(DB_KEY, JSON.stringify(dbData));
         }
       } catch (e) {
         console.warn('Schools sync exception:', e.message);
       }
     }
 
-    // 3) Sync students — tu wale wenye school_id halali tu (vinginevyo FK error)
+    // 3) Sync students — WOTE, hata bila shule
     if (Array.isArray(dbData.students) && dbData.students.length) {
-      const studentRows = dbData.students
-        .map(s => {
-          const serverSchoolId = s.schoolId ? (schoolIdMap[s.schoolId] || null) : null;
-          return {
-            name: s.name,
-            contact: s.contact,
-            auth_user_id: s.authUserId || null,
-            level: s.level,
-            status: s.status || 'new',
-            school_id: serverSchoolId,
-            class_id: s.classId || null,
-            created_at: new Date(s.createdAt || Date.now()).toISOString()
-          };
-        })
-        .filter(r => r.school_id); // ruka asiye na school halali
+      const studentRows = dbData.students.map(s => {
+        // Pata server UUID ya school (kama anayo)
+        let serverSchoolId = null;
+        if (s.schoolId) {
+          const sch = dbData.schools.find(x => x.id === s.schoolId);
+          serverSchoolId = (sch && sch.serverId) ? sch.serverId : null;
+        }
+        return {
+          ...(s.serverId ? { id: s.serverId } : {}),
+          name: s.name,
+          contact: s.contact,
+          auth_user_id: s.authUserId || null,
+          level: s.level,
+          status: s.status || 'new',
+          school_id: serverSchoolId, // inaweza kuwa null — sasa ni sawa
+          class_id: s.classId || null,
+          applied_at: s.appliedAt ? new Date(s.appliedAt).toISOString() : null,
+          verified_at: s.verifiedAt ? new Date(s.verifiedAt).toISOString() : null,
+          created_at: new Date(s.createdAt || Date.now()).toISOString()
+        };
+      });
 
-      if (studentRows.length) {
-        sbClient.from('zayoma_students')
+      try {
+        const { data: upserted, error } = await sbClient
+          .from('zayoma_students')
           .upsert(studentRows, { onConflict: 'contact,level', ignoreDuplicates: false })
-          .then(({ error }) => { if (error) console.warn('Students sync error:', error.message); });
+          .select('id, contact, level');
+        if (error) {
+          console.warn('Students sync error:', error.message);
+        } else if (Array.isArray(upserted)) {
+          const byKey = {};
+          upserted.forEach(r => { byKey[`${r.contact}|${r.level}`] = r.id; });
+          let changed = false;
+          dbData.students.forEach(s => {
+            const k = `${(s.contact||'').trim()}|${(s.level||'').trim()}`;
+            if (byKey[k] && s.serverId !== byKey[k]) { s.serverId = byKey[k]; changed = true; }
+          });
+          if (changed) localStorage.setItem(DB_KEY, JSON.stringify(dbData));
+        }
+      } catch (e) {
+        console.warn('Students sync exception:', e.message);
       }
     }
   } catch (err) {
     console.error("Mfumo haukuweza kuwasiliana na Supabase:", err);
+  }
+}
+
+/* ============================================================
+   ============== LOAD FROM SUPABASE (DATA NEVER LOST) ========
+   Inaitwa mara tu app inapoanza. Inachota schools na students
+   kutoka cloud na kuziunganisha na localStorage.
+   ============================================================ */
+async function loadFromSupabase() {
+  try {
+    if (!sbClient || typeof sbClient.from !== 'function') return;
+
+    // 1) Schools
+    const { data: schools, error: sErr } = await sbClient
+      .from('zayoma_schools')
+      .select('id, name, contact, level, status, auth_user_id, created_at');
+    if (sErr) { console.warn('Load schools error:', sErr.message); }
+    else if (Array.isArray(schools)) {
+      schools.forEach(srv => {
+        const key = `${srv.contact}|${srv.level}`;
+        let local = db.schools.find(x => `${x.contact}|${x.level}` === key);
+        if (!local) {
+          local = {
+            id: 'srv_' + srv.id.slice(0,8),
+            serverId: srv.id,
+            name: srv.name,
+            contact: srv.contact,
+            level: srv.level,
+            authUserId: srv.auth_user_id,
+            schoolStatus: srv.status || 'pending',
+            password: '', // password haihifadhiwi server — tunategemea Supabase Auth
+            createdAt: new Date(srv.created_at).getTime()
+          };
+          db.schools.push(local);
+        } else {
+          local.serverId = srv.id;
+          local.schoolStatus = srv.status || local.schoolStatus || 'pending';
+          local.authUserId = local.authUserId || srv.auth_user_id;
+        }
+      });
+    }
+
+    // 2) Students
+    const { data: students, error: stErr } = await sbClient
+      .from('zayoma_students')
+      .select('id, name, contact, level, status, school_id, class_id, auth_user_id, applied_at, verified_at, created_at');
+    if (stErr) { console.warn('Load students error:', stErr.message); }
+    else if (Array.isArray(students)) {
+      students.forEach(srv => {
+        const key = `${srv.contact}|${srv.level}`;
+        let local = db.students.find(x => `${x.contact}|${x.level}` === key);
+        // Tafuta local school id kutoka serverId
+        const localSchool = srv.school_id ? db.schools.find(s => s.serverId === srv.school_id) : null;
+        if (!local) {
+          local = {
+            id: 'srv_' + srv.id.slice(0,8),
+            serverId: srv.id,
+            name: srv.name,
+            contact: srv.contact,
+            level: srv.level,
+            status: srv.status || 'new',
+            schoolId: localSchool ? localSchool.id : null,
+            classId: srv.class_id || null,
+            authUserId: srv.auth_user_id,
+            password: '',
+            appliedAt: srv.applied_at ? new Date(srv.applied_at).getTime() : null,
+            verifiedAt: srv.verified_at ? new Date(srv.verified_at).getTime() : null,
+            createdAt: new Date(srv.created_at).getTime()
+          };
+          db.students.push(local);
+        } else {
+          local.serverId = srv.id;
+          local.status = srv.status || local.status;
+          if (localSchool) local.schoolId = localSchool.id;
+          if (srv.class_id) local.classId = srv.class_id;
+          local.authUserId = local.authUserId || srv.auth_user_id;
+        }
+      });
+    }
+
+    localStorage.setItem(DB_KEY, JSON.stringify(db));
+    console.log(`✓ Cloud sync: ${db.schools.length} schools, ${db.students.length} students`);
+  } catch (err) {
+    console.warn('loadFromSupabase exception:', err.message);
   }
 }
 
@@ -1197,12 +1315,14 @@ async function handleAuth(e, action){
         if (db.schools.some(s=>s.contact===contact && s.level===level)){
           finish(); toast(LANG==='sw'?'Shule tayari imesajiliwa':'School already registered','error'); return;
         }
-        const sch = { id:uid(), name:nameVal, contact, password, level, authUserId, createdAt:Date.now() };
+        const sch = { id:uid(), name:nameVal, contact, password, level, authUserId, schoolStatus:'pending', createdAt:Date.now() };
         db.schools.push(sch); saveDB();
         currentSchoolId = sch.id;
         saveSession('school', sch.id);
         finish();
-        toast(LANG==='sw'?'Usajili umekamilika':'Registered');
+        toast(LANG==='sw'
+          ? 'Usajili umekamilika! Shule yako inasubiri uthibitisho wa admin.'
+          : 'Registered! Your school is awaiting admin approval.', 'success');
         enterSchoolApp();
       } else {
         if (db.students.some(s=>s.contact===contact && s.level===level)){
@@ -1228,10 +1348,12 @@ async function handleAuth(e, action){
       }
 
       if (role==='school'){
+        // Pakua tena kutoka cloud kuhakikisha tuna data ya hivi karibuni
+        await loadFromSupabase();
         const sch = db.schools.find(s=>s.contact===contact && s.level===level);
         if (!sch){
           finish();
-          toast(LANG==='sw'?'Akaunti ya shule haijapatikana kwenye kifaa hiki':'School profile not found on this device','error');
+          toast(LANG==='sw'?'Akaunti ya shule haijapatikana':'School profile not found','error');
           return;
         }
         currentSchoolId = sch.id;
@@ -1239,6 +1361,7 @@ async function handleAuth(e, action){
         finish();
         enterSchoolApp();
       } else {
+        await loadFromSupabase();
         const stu = db.students.find(s=>s.contact===contact && s.level===level);
         if (!stu){
           finish();
@@ -1322,9 +1445,21 @@ function showStudentSchoolPicker(){
 }
 function renderStudentSchoolList(){
   const q = (document.getElementById('stuPickSearch').value||'').toLowerCase();
-  const list = db.schools.filter(s=>s.level===STATE.level && s.name.toLowerCase().includes(q));
+  // Onyesha shule ZILIZOIDHINISHWA tu (approved). Pending hazionekani kwa wanafunzi.
+  const list = db.schools.filter(s =>
+    s.level === STATE.level &&
+    (s.schoolStatus === 'approved') &&
+    s.name.toLowerCase().includes(q)
+  );
   const wrap=document.getElementById('stuPickList'), em=document.getElementById('stuPickEmpty');
-  if (list.length===0){ wrap.innerHTML=''; em.classList.remove('hidden'); return; }
+  if (list.length===0){
+    wrap.innerHTML='';
+    em.classList.remove('hidden');
+    em.innerHTML = `<i class="fa-solid fa-school text-3xl text-gray-300 mb-2"></i>
+      <p class="text-sm">${LANG==='sw'?'Hakuna shule iliyoidhinishwa bado kwa kiwango hiki.':'No approved schools yet for this level.'}</p>
+      <p class="text-xs text-gray-400 mt-2">${LANG==='sw'?'Subiri admin athibitishe shule, kisha jaribu tena.':'Wait for admin to approve a school, then try again.'}</p>`;
+    return;
+  }
   em.classList.add('hidden');
   wrap.innerHTML = list.map(s=>{
     const classCount = db.classes.filter(c=>c.schoolId===s.id).length;
@@ -2243,10 +2378,14 @@ function startTimer(duration){
    ============================================================ */
 applyI18n();
 
-// Angalia kama kuna mtu alikuwa tayari amelogin
-if (!checkSession()) {
-  // Kama hakuna session, mwache achague lugha (default ya HTML)
-}
+// 1) Pakua data kutoka Supabase kwanza (data isipotee kamwe!)
+// 2) Halafu angalia kama kuna session ya zamani
+(async () => {
+  await loadFromSupabase();
+  if (!checkSession()) {
+    // Hakuna session — mwache achague lugha
+  }
+})();
 
 
 /* ============================================================
